@@ -1,0 +1,404 @@
+name: Build APK
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Gerar projeto e compilar
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.patoyedits.floatingtimer"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.patoyedits.floatingtimer"; minSdk = 26; targetSdk = 33; versionCode = 2; versionName = "2.0" }
+              buildTypes {
+                  release {
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+                      signingConfig = signingConfigs.getByName("debug") // instalável direto
+                  }
+              }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          // Zero dependências: sem AndroidX/AppCompat => APK minúsculo e start rápido.
+          EOF_FILE
+          mkdir -p app
+          cat > app/proguard-rules.pro <<'EOF_FILE'
+          -assumenosideeffects class kotlin.jvm.internal.Intrinsics { *; }
+          -repackageclasses ''
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <application
+                  android:label="Santos Timer"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".TimerOverlayService" android:exported="false" />
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/patoyedits/floatingtimer
+          cat > app/src/main/java/com/patoyedits/floatingtimer/LiveSplitTimerView.kt <<'EOF_FILE'
+          package com.patoyedits.floatingtimer
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.LinearGradient
+          import android.graphics.Paint
+          import android.graphics.Shader
+          import android.graphics.Typeface
+          import android.os.SystemClock
+          import android.util.TypedValue
+          import android.view.Choreographer
+          import android.view.GestureDetector
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewConfiguration
+          import java.util.Locale
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.min
+
+          /**
+           * Visual estilo LiveSplit: título, lista de splits (segmento atual em azul),
+           * delta verde/vermelho vs. melhor tempo (PB), timer grande à direita com
+           * decimais menores, dourado ao bater PB.
+           * Toque: iniciar/pausar | 2 toques: zerar | segurar: split | arrastar: mover.
+           */
+          class LiveSplitTimerView(ctx: Context, private val s: TimerSettings) : View(ctx) {
+              private enum class State { IDLE, RUNNING, PAUSED, FINISHED }
+
+              var onDrag: ((Float, Float) -> Unit)? = null
+              var interactive = true
+
+              private var state = State.IDLE
+              private val dm = resources.displayMetrics
+              private val dp = dm.density
+              private fun sp(v: Float) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, v, dm)
+
+              // ---- dados ----
+              private var names: List<String> = emptyList()
+              private var title = ""
+              private var pb = LongArray(0)
+              private var done = LongArray(0)
+              private var doneText = arrayOfNulls<String>(0)
+              private var deltaText = arrayOfNulls<String>(0)
+              private var deltaCol = IntArray(0)
+              private var pbText = arrayOf<String>()
+              private var doneCount = 0
+              private var isPb = false
+              private var base = 0L
+              private var startedAt = 0L
+              private var lastCs = -1L
+              private var runColor = TimerSettings.DEFAULT_COLOR
+
+              // ---- medidas (calculadas fora do onDraw) ----
+              private val pad = 8 * dp
+              private val rowH = 22 * dp
+              private var widthPx = (280 * dp).toInt()
+              private var timerH = 0f
+              private var baseOff = 0f
+              private var decW = 0f
+
+              // ---- paints (criados uma vez) ----
+              private fun mk(size: Float, bold: Boolean, a: Paint.Align) = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  textSize = size; textAlign = a
+                  typeface = if (bold) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+                  fontFeatureSettings = "tnum" // dígitos de largura fixa: sem "tremer"
+              }
+              private val bg = Paint()
+              private val hl = Paint()
+              private val line = Paint().apply { color = 0x33FFFFFF }
+              private val titleP = mk(sp(13f), true, Paint.Align.LEFT).apply { color = Color.WHITE }
+              private val nameP = mk(sp(12f), false, Paint.Align.LEFT).apply { color = 0xFFEEEEEE.toInt() }
+              private val timeP = mk(sp(12f), false, Paint.Align.RIGHT)
+              private val mainP = mk(sp(40f), true, Paint.Align.RIGHT)
+              private val decP = mk(sp(22f), true, Paint.Align.RIGHT)
+
+              // ---- formatação sem alocação por frame ----
+              private val mainBuf = CharArray(12)
+              private var mainLen = 0
+              private val decBuf = charArrayOf('.', '0', '0')
+
+              private fun put(at: Int, v: Int, minD: Int): Int {
+                  var digits = 1; var x = v / 10
+                  while (x > 0) { digits++; x /= 10 }
+                  val n = max(digits, minD); var r = v
+                  for (i in n - 1 downTo 0) { mainBuf[at + i] = '0' + r % 10; r /= 10 }
+                  return at + n
+              }
+
+              private fun fill(t: Long) {
+                  val h = (t / 3600000).toInt(); val m = ((t / 60000) % 60).toInt()
+                  val sec = ((t / 1000) % 60).toInt(); val cs = ((t / 10) % 100).toInt()
+                  var n: Int
+                  if (h > 0) { n = put(0, h, 1); mainBuf[n++] = ':'; n = put(n, m, 2); mainBuf[n++] = ':'; n = put(n, sec, 2) }
+                  else if (m > 0) { n = put(0, m, 1); mainBuf[n++] = ':'; n = put(n, sec, 2) }
+                  else n = put(0, sec, 1)
+                  mainLen = n
+                  decBuf[1] = '0' + cs / 10; decBuf[2] = '0' + cs % 10
+              }
+
+              private fun short(ms: Long): String {
+                  val t = abs(ms); val h = t / 3600000; val m = (t / 60000) % 60; val sec = (t / 1000) % 60; val cs = (t / 10) % 100
+                  return when {
+                      h > 0 -> String.format(Locale.US, "%d:%02d:%02d", h, m, sec)
+                      m > 0 -> String.format(Locale.US, "%d:%02d.%02d", m, sec, cs)
+                      else -> String.format(Locale.US, "%d.%02d", sec, cs)
+                  }
+              }
+
+              // ---- ciclo de vida ----
+              private val prefsL = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> reload() }
+
+              override fun onAttachedToWindow() {
+                  super.onAttachedToWindow()
+                  s.register(prefsL); reload()
+                  if (state == State.RUNNING) loop()
+              }
+
+              override fun onDetachedFromWindow() {
+                  s.unregister(prefsL)
+                  Choreographer.getInstance().removeFrameCallback(frame)
+                  super.onDetachedFromWindow()
+              }
+
+              fun reload() {
+                  names = s.splitNames; title = s.title; pb = s.pb; runColor = s.color
+                  widthPx = (s.widthDp * dp).toInt()
+                  if (done.size != names.size) {
+                      done = LongArray(names.size); doneText = arrayOfNulls(names.size)
+                      deltaText = arrayOfNulls(names.size); deltaCol = IntArray(names.size)
+                      resetRun()
+                  }
+                  mainP.textSize = sp(s.sizeSp.toFloat()); decP.textSize = mainP.textSize * 0.55f
+                  decW = decP.measureText(".00")
+                  val fm = mainP.fontMetrics
+                  baseOff = -fm.ascent + 6 * dp
+                  timerH = fm.descent - fm.ascent + 12 * dp
+                  pbText = Array(names.size) { if (pb.size == names.size) short(pb[it]) else "-" }
+                  requestLayout(); invalidate()
+              }
+
+              // ---- cronômetro ----
+              private fun elapsed() = if (state == State.RUNNING) base + SystemClock.elapsedRealtime() - startedAt else base
+
+              private val frame = object : Choreographer.FrameCallback {
+                  override fun doFrame(frameTimeNanos: Long) {
+                      if (state != State.RUNNING || !isAttachedToWindow) return
+                      val cs = elapsed() / 10
+                      if (cs != lastCs) { lastCs = cs; invalidate() } // só redesenha se o texto mudou
+                      Choreographer.getInstance().postFrameCallback(this)
+                  }
+              }
+
+              private fun loop() {
+                  val c = Choreographer.getInstance(); c.removeFrameCallback(frame); c.postFrameCallback(frame)
+              }
+
+              private fun toggle() {
+                  when (state) {
+                      State.IDLE, State.PAUSED -> { startedAt = SystemClock.elapsedRealtime(); state = State.RUNNING; lastCs = -1; loop() }
+                      State.RUNNING -> { base = elapsed(); state = State.PAUSED; invalidate() }
+                      State.FINISHED -> {}
+                  }
+              }
+
+              private fun split() {
+                  if (state != State.RUNNING || doneCount >= names.size) return
+                  val t = elapsed(); val i = doneCount
+                  done[i] = t; doneText[i] = short(t)
+                  if (pb.size == names.size) {
+                      val d = t - pb[i]
+                      deltaText[i] = (if (d < 0) "-" else "+") + short(d)
+                      deltaCol[i] = if (d < 0) AHEAD else BEHIND
+                  } else deltaText[i] = null
+                  doneCount++
+                  if (doneCount == names.size) {
+                      base = t; state = State.FINISHED
+                      if (pb.size != names.size || t < pb[names.size - 1]) { isPb = true; s.pb = done.copyOf() }
+                  }
+                  invalidate()
+              }
+
+              private fun resetRun() {
+                  state = State.IDLE; base = 0; doneCount = 0; isPb = false
+                  doneText.fill(null); deltaText.fill(null); invalidate()
+              }
+
+              // ---- layout ----
+              private fun rows() = min(names.size, 6)
+              private fun headH() = if (title.isBlank()) 0f else 26 * dp
+
+              override fun onMeasure(w: Int, h: Int) {
+                  val r = rows()
+                  setMeasuredDimension(widthPx, (headH() + r * rowH + (if (r > 0) dp else 0f) + timerH).toInt())
+              }
+
+              override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+                  bg.shader = LinearGradient(0f, 0f, 0f, h.toFloat(), 0xF21B1B1B.toInt(), 0xF20A0A0A.toInt(), Shader.TileMode.CLAMP)
+                  hl.shader = LinearGradient(0f, 0f, 0f, rowH, 0xFF3373F4.toInt(), 0xFF153574.toInt(), Shader.TileMode.CLAMP)
+              }
+
+              private fun timerColor(t: Long): Int = when (state) {
+                  State.IDLE -> 0xFFAAAAAA.toInt()
+                  State.PAUSED -> 0xFF7F8C9A.toInt()
+                  State.FINISHED -> if (isPb) GOLD else runColor
+                  State.RUNNING -> if (doneCount < pb.size && pb.size == names.size && t > pb[doneCount]) BEHIND else runColor
+              }
+
+              override fun onDraw(c: Canvas) {
+                  val w = width.toFloat()
+                  c.drawRect(0f, 0f, w, height.toFloat(), bg)
+                  var y = 0f
+                  if (title.isNotBlank()) { c.drawText(title, pad, y + headH() * 0.68f, titleP); y += headH() }
+
+                  val rows = rows()
+                  if (rows > 0) {
+                      val n = names.size
+                      val start = (min(doneCount, n - 1) - (rows - 2)).coerceIn(0, n - rows)
+                      for (i in start until start + rows) {
+                          if (i == doneCount && state != State.FINISHED) {
+                              c.save(); c.translate(0f, y); c.drawRect(0f, 0f, w, rowH, hl); c.restore()
+                          }
+                          val by = y + rowH * 0.68f
+                          c.save(); c.clipRect(pad, y, max(pad + 1f, w - 124 * dp), y + rowH)
+                          c.drawText(names[i], pad, by, nameP); c.restore()
+                          val isDone = i < doneCount
+                          timeP.color = if (isDone) Color.WHITE else 0xFF9A9A9A.toInt()
+                          c.drawText((if (isDone) doneText[i] else pbText[i]) ?: "", w - pad, by, timeP)
+                          val dt = if (isDone) deltaText[i] else null
+                          if (dt != null) { timeP.color = deltaCol[i]; c.drawText(dt, w - pad - 62 * dp, by, timeP) }
+                          y += rowH
+                      }
+                      c.drawRect(0f, y, w, y + dp, line); y += dp
+                  }
+
+                  val t = elapsed(); fill(t)
+                  val col = timerColor(t); mainP.color = col; decP.color = col
+                  val by = y + baseOff
+                  c.drawText(decBuf, 0, 3, w - pad, by, decP)
+                  c.drawText(mainBuf, 0, mainLen, w - pad - decW, by, mainP)
+              }
+
+              // ---- toque / arrastar (coordenadas "raw": a janela anda junto com o dedo) ----
+              private var dX = 0f; private var dY = 0f; private var lx = 0f; private var ly = 0f
+              private var moved = false
+              private var lastTap = 0L
+              private val slop = ViewConfiguration.get(ctx).scaledTouchSlop
+
+              private val gd = GestureDetector(ctx, object : GestureDetector.SimpleOnGestureListener() {
+                  override fun onSingleTapUp(e: MotionEvent): Boolean {
+                      if (moved) return false
+                      val now = SystemClock.uptimeMillis()
+                      if (now - lastTap < 300) { resetRun(); lastTap = 0 } else { toggle(); lastTap = now }
+                      return true
+                  }
+                  override fun onLongPress(e: MotionEvent) { if (!moved) split() }
+              })
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  if (!interactive) return false
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> { dX = e.rawX; dY = e.rawY; lx = dX; ly = dY; moved = false }
+                      MotionEvent.ACTION_MOVE -> {
+                          if (!moved && (abs(e.rawX - dX) > slop || abs(e.rawY - dY) > slop)) moved = true
+                          if (moved) { onDrag?.invoke(e.rawX - lx, e.rawY - ly); lx = e.rawX; ly = e.rawY }
+                      }
+                  }
+                  gd.onTouchEvent(e)
+                  return true
+              }
+
+              private companion object {
+                  val AHEAD = 0xFF00CC36.toInt()
+                  val BEHIND = 0xFFCC1200.toInt()
+                  val GOLD = 0xFFFFD500.toInt()
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/patoyedits/floatingtimer
+          cat > app/src/main/java/com/patoyedits/floatingtimer/MainActivity.kt <<'EOF_FILE'
+          package com.patoyedits.floatingtimer
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.Editable
+          import android.text.TextWatcher
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val s = TimerSettings(this)
+                  val dp = resources.displayMetrics.density
+                  fun px(v: Int) = (v * dp).toInt()
+
+                  fun label(t: String) = TextView(this).apply {
+                      text = t; setTextColor(0xFF9A9A9A.toInt()); textSize = 13f; setPadding(0, px(16), 0, px(4))
+                  }
+
+                  fun edit(value: String, hintText: String, multi: Boolean, onChange: (String) -> Unit) = EditText(this).apply {
+                      setText(value); hint = hintText; setTextColor(Color.WHITE); setHintTextColor(0xFF666666.toInt())
+                      if (multi) { minLines = 3; gravity = Gravity.TOP }
+                      addTextChangedListener(object : TextWatcher {
+                          override fun afterTextChanged(e: Editable?) { onChange(e?.toString() ?: "") }
+                          override fun beforeTextChanged(a: CharSequence?, st: Int, c: Int, af: Int) {}
+                          override fun onTextChanged(a: CharSequence?, st: Int, b: Int, c: Int) {}
+                      })
+                  }
+
+                  fun slider(text: String, lo: Int, hi: Int, v: Int, set: (Int) -> Unit) = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      val tv = label("$text: $v"); addView(tv)
+                      addView(SeekBar(this@MainActivity).apply {
+                          this.max = hi - lo; progress = v - lo
+                          setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                              override fun onProgressChanged(sb: SeekBar?, p: Int, user: Boolean) { set(p + lo); tv.text = "$text: ${p + lo}" }
+                              override fun onStartTrackingTouch(sb: SeekBar?) {}
+                              override fun onStopTrackingTouch(sb: SeekBar?) {}
+                          })
+                      })
+                  }
+
+                  fun button(
