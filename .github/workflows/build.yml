@@ -15,390 +15,149 @@ jobs:
           gradle-version: "8.7"
       - name: Gerar projeto e compilar
         run: |
-          mkdir -p app
-          cat > app/build.gradle.kts <<'EOF_FILE'
-          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
-          android {
-              namespace = "com.patoyedits.floatingtimer"
-              compileSdk = 34
-              defaultConfig { applicationId = "com.patoyedits.floatingtimer"; minSdk = 26; targetSdk = 33; versionCode = 2; versionName = "2.0" }
-              buildTypes {
-                  release {
-                      isMinifyEnabled = true
-                      isShrinkResources = true
-                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-                      signingConfig = signingConfigs.getByName("debug") // instalável direto
-                  }
-              }
-              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
-              kotlinOptions { jvmTarget = "17" }
-          }
-          // Zero dependências: sem AndroidX/AppCompat => APK minúsculo e start rápido.
-          EOF_FILE
-          mkdir -p app
-          cat > app/proguard-rules.pro <<'EOF_FILE'
-          -assumenosideeffects class kotlin.jvm.internal.Intrinsics { *; }
-          -repackageclasses ''
-          EOF_FILE
-          mkdir -p app/src/main
-          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
-          <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-              <application
-                  android:label="Santos Timer"
-                  android:allowBackup="false"
-                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
-                  <activity android:name=".MainActivity" android:exported="true">
-                      <intent-filter>
-                          <action android:name="android.intent.action.MAIN" />
-                          <category android:name="android.intent.category.LAUNCHER" />
-                      </intent-filter>
-                  </activity>
-                  <service android:name=".TimerOverlayService" android:exported="false" />
-              </application>
-          </manifest>
-          EOF_FILE
-          mkdir -p app/src/main/java/com/patoyedits/floatingtimer
-          cat > app/src/main/java/com/patoyedits/floatingtimer/LiveSplitTimerView.kt <<'EOF_FILE'
-          package com.patoyedits.floatingtimer
-
-          import android.content.Context
-          import android.content.SharedPreferences
-          import android.graphics.Canvas
-          import android.graphics.Color
-          import android.graphics.LinearGradient
-          import android.graphics.Paint
-          import android.graphics.Shader
-          import android.graphics.Typeface
-          import android.os.SystemClock
-          import android.util.TypedValue
-          import android.view.Choreographer
-          import android.view.GestureDetector
-          import android.view.MotionEvent
-          import android.view.View
-          import android.view.ViewConfiguration
-          import java.util.Locale
-          import kotlin.math.abs
-          import kotlin.math.max
-          import kotlin.math.min
-
-          /**
-           * Visual estilo LiveSplit: título, lista de splits (segmento atual em azul),
-           * delta verde/vermelho vs. melhor tempo (PB), timer grande à direita com
-           * decimais menores, dourado ao bater PB.
-           * Toque: iniciar/pausar | 2 toques: zerar | segurar: split | arrastar: mover.
-           */
-          class LiveSplitTimerView(ctx: Context, private val s: TimerSettings) : View(ctx) {
-              private enum class State { IDLE, RUNNING, PAUSED, FINISHED }
-
-              var onDrag: ((Float, Float) -> Unit)? = null
-              var interactive = true
-
-              private var state = State.IDLE
-              private val dm = resources.displayMetrics
-              private val dp = dm.density
-              private fun sp(v: Float) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, v, dm)
-
-              // ---- dados ----
-              private var names: List<String> = emptyList()
-              private var title = ""
-              private var pb = LongArray(0)
-              private var done = LongArray(0)
-              private var doneText = arrayOfNulls<String>(0)
-              private var deltaText = arrayOfNulls<String>(0)
-              private var deltaCol = IntArray(0)
-              private var pbText = arrayOf<String>()
-              private var doneCount = 0
-              private var isPb = false
-              private var base = 0L
-              private var startedAt = 0L
-              private var lastCs = -1L
-              private var runColor = TimerSettings.DEFAULT_COLOR
-
-              // ---- medidas (calculadas fora do onDraw) ----
-              private val pad = 8 * dp
-              private val rowH = 22 * dp
-              private var widthPx = (280 * dp).toInt()
-              private var timerH = 0f
-              private var baseOff = 0f
-              private var decW = 0f
-
-              // ---- paints (criados uma vez) ----
-              private fun mk(size: Float, bold: Boolean, a: Paint.Align) = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  textSize = size; textAlign = a
-                  typeface = if (bold) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
-                  fontFeatureSettings = "tnum" // dígitos de largura fixa: sem "tremer"
-              }
-              private val bg = Paint()
-              private val hl = Paint()
-              private val line = Paint().apply { color = 0x33FFFFFF }
-              private val titleP = mk(sp(13f), true, Paint.Align.LEFT).apply { color = Color.WHITE }
-              private val nameP = mk(sp(12f), false, Paint.Align.LEFT).apply { color = 0xFFEEEEEE.toInt() }
-              private val timeP = mk(sp(12f), false, Paint.Align.RIGHT)
-              private val mainP = mk(sp(40f), true, Paint.Align.RIGHT)
-              private val decP = mk(sp(22f), true, Paint.Align.RIGHT)
-
-              // ---- formatação sem alocação por frame ----
-              private val mainBuf = CharArray(12)
-              private var mainLen = 0
-              private val decBuf = charArrayOf('.', '0', '0')
-
-              private fun put(at: Int, v: Int, minD: Int): Int {
-                  var digits = 1; var x = v / 10
-                  while (x > 0) { digits++; x /= 10 }
-                  val n = max(digits, minD); var r = v
-                  for (i in n - 1 downTo 0) { mainBuf[at + i] = '0' + r % 10; r /= 10 }
-                  return at + n
-              }
-
-              private fun fill(t: Long) {
-                  val h = (t / 3600000).toInt(); val m = ((t / 60000) % 60).toInt()
-                  val sec = ((t / 1000) % 60).toInt(); val cs = ((t / 10) % 100).toInt()
-                  var n: Int
-                  if (h > 0) { n = put(0, h, 1); mainBuf[n++] = ':'; n = put(n, m, 2); mainBuf[n++] = ':'; n = put(n, sec, 2) }
-                  else if (m > 0) { n = put(0, m, 1); mainBuf[n++] = ':'; n = put(n, sec, 2) }
-                  else n = put(0, sec, 1)
-                  mainLen = n
-                  decBuf[1] = '0' + cs / 10; decBuf[2] = '0' + cs % 10
-              }
-
-              private fun short(ms: Long): String {
-                  val t = abs(ms); val h = t / 3600000; val m = (t / 60000) % 60; val sec = (t / 1000) % 60; val cs = (t / 10) % 100
-                  return when {
-                      h > 0 -> String.format(Locale.US, "%d:%02d:%02d", h, m, sec)
-                      m > 0 -> String.format(Locale.US, "%d:%02d.%02d", m, sec, cs)
-                      else -> String.format(Locale.US, "%d.%02d", sec, cs)
-                  }
-              }
-
-              // ---- ciclo de vida ----
-              private val prefsL = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> reload() }
-
-              override fun onAttachedToWindow() {
-                  super.onAttachedToWindow()
-                  s.register(prefsL); reload()
-                  if (state == State.RUNNING) loop()
-              }
-
-              override fun onDetachedFromWindow() {
-                  s.unregister(prefsL)
-                  Choreographer.getInstance().removeFrameCallback(frame)
-                  super.onDetachedFromWindow()
-              }
-
-              fun reload() {
-                  names = s.splitNames; title = s.title; pb = s.pb; runColor = s.color
-                  widthPx = (s.widthDp * dp).toInt()
-                  if (done.size != names.size) {
-                      done = LongArray(names.size); doneText = arrayOfNulls(names.size)
-                      deltaText = arrayOfNulls(names.size); deltaCol = IntArray(names.size)
-                      resetRun()
-                  }
-                  mainP.textSize = sp(s.sizeSp.toFloat()); decP.textSize = mainP.textSize * 0.55f
-                  decW = decP.measureText(".00")
-                  val fm = mainP.fontMetrics
-                  baseOff = -fm.ascent + 6 * dp
-                  timerH = fm.descent - fm.ascent + 12 * dp
-                  pbText = Array(names.size) { if (pb.size == names.size) short(pb[it]) else "-" }
-                  requestLayout(); invalidate()
-              }
-
-              // ---- cronômetro ----
-              private fun elapsed() = if (state == State.RUNNING) base + SystemClock.elapsedRealtime() - startedAt else base
-
-              private val frame = object : Choreographer.FrameCallback {
-                  override fun doFrame(frameTimeNanos: Long) {
-                      if (state != State.RUNNING || !isAttachedToWindow) return
-                      val cs = elapsed() / 10
-                      if (cs != lastCs) { lastCs = cs; invalidate() } // só redesenha se o texto mudou
-                      Choreographer.getInstance().postFrameCallback(this)
-                  }
-              }
-
-              private fun loop() {
-                  val c = Choreographer.getInstance(); c.removeFrameCallback(frame); c.postFrameCallback(frame)
-              }
-
-              private fun toggle() {
-                  when (state) {
-                      State.IDLE, State.PAUSED -> { startedAt = SystemClock.elapsedRealtime(); state = State.RUNNING; lastCs = -1; loop() }
-                      State.RUNNING -> { base = elapsed(); state = State.PAUSED; invalidate() }
-                      State.FINISHED -> {}
-                  }
-              }
-
-              private fun split() {
-                  if (state != State.RUNNING || doneCount >= names.size) return
-                  val t = elapsed(); val i = doneCount
-                  done[i] = t; doneText[i] = short(t)
-                  if (pb.size == names.size) {
-                      val d = t - pb[i]
-                      deltaText[i] = (if (d < 0) "-" else "+") + short(d)
-                      deltaCol[i] = if (d < 0) AHEAD else BEHIND
-                  } else deltaText[i] = null
-                  doneCount++
-                  if (doneCount == names.size) {
-                      base = t; state = State.FINISHED
-                      if (pb.size != names.size || t < pb[names.size - 1]) { isPb = true; s.pb = done.copyOf() }
-                  }
-                  invalidate()
-              }
-
-              private fun resetRun() {
-                  state = State.IDLE; base = 0; doneCount = 0; isPb = false
-                  doneText.fill(null); deltaText.fill(null); invalidate()
-              }
-
-              // ---- layout ----
-              private fun rows() = min(names.size, 6)
-              private fun headH() = if (title.isBlank()) 0f else 26 * dp
-
-              override fun onMeasure(w: Int, h: Int) {
-                  val r = rows()
-                  setMeasuredDimension(widthPx, (headH() + r * rowH + (if (r > 0) dp else 0f) + timerH).toInt())
-              }
-
-              override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
-                  bg.shader = LinearGradient(0f, 0f, 0f, h.toFloat(), 0xF21B1B1B.toInt(), 0xF20A0A0A.toInt(), Shader.TileMode.CLAMP)
-                  hl.shader = LinearGradient(0f, 0f, 0f, rowH, 0xFF3373F4.toInt(), 0xFF153574.toInt(), Shader.TileMode.CLAMP)
-              }
-
-              private fun timerColor(t: Long): Int = when (state) {
-                  State.IDLE -> 0xFFAAAAAA.toInt()
-                  State.PAUSED -> 0xFF7F8C9A.toInt()
-                  State.FINISHED -> if (isPb) GOLD else runColor
-                  State.RUNNING -> if (doneCount < pb.size && pb.size == names.size && t > pb[doneCount]) BEHIND else runColor
-              }
-
-              override fun onDraw(c: Canvas) {
-                  val w = width.toFloat()
-                  c.drawRect(0f, 0f, w, height.toFloat(), bg)
-                  var y = 0f
-                  if (title.isNotBlank()) { c.drawText(title, pad, y + headH() * 0.68f, titleP); y += headH() }
-
-                  val rows = rows()
-                  if (rows > 0) {
-                      val n = names.size
-                      val start = (min(doneCount, n - 1) - (rows - 2)).coerceIn(0, n - rows)
-                      for (i in start until start + rows) {
-                          if (i == doneCount && state != State.FINISHED) {
-                              c.save(); c.translate(0f, y); c.drawRect(0f, 0f, w, rowH, hl); c.restore()
-                          }
-                          val by = y + rowH * 0.68f
-                          c.save(); c.clipRect(pad, y, max(pad + 1f, w - 124 * dp), y + rowH)
-                          c.drawText(names[i], pad, by, nameP); c.restore()
-                          val isDone = i < doneCount
-                          timeP.color = if (isDone) Color.WHITE else 0xFF9A9A9A.toInt()
-                          c.drawText((if (isDone) doneText[i] else pbText[i]) ?: "", w - pad, by, timeP)
-                          val dt = if (isDone) deltaText[i] else null
-                          if (dt != null) { timeP.color = deltaCol[i]; c.drawText(dt, w - pad - 62 * dp, by, timeP) }
-                          y += rowH
-                      }
-                      c.drawRect(0f, y, w, y + dp, line); y += dp
-                  }
-
-                  val t = elapsed(); fill(t)
-                  val col = timerColor(t); mainP.color = col; decP.color = col
-                  val by = y + baseOff
-                  c.drawText(decBuf, 0, 3, w - pad, by, decP)
-                  c.drawText(mainBuf, 0, mainLen, w - pad - decW, by, mainP)
-              }
-
-              // ---- toque / arrastar (coordenadas "raw": a janela anda junto com o dedo) ----
-              private var dX = 0f; private var dY = 0f; private var lx = 0f; private var ly = 0f
-              private var moved = false
-              private var lastTap = 0L
-              private val slop = ViewConfiguration.get(ctx).scaledTouchSlop
-
-              private val gd = GestureDetector(ctx, object : GestureDetector.SimpleOnGestureListener() {
-                  override fun onSingleTapUp(e: MotionEvent): Boolean {
-                      if (moved) return false
-                      val now = SystemClock.uptimeMillis()
-                      if (now - lastTap < 300) { resetRun(); lastTap = 0 } else { toggle(); lastTap = now }
-                      return true
-                  }
-                  override fun onLongPress(e: MotionEvent) { if (!moved) split() }
-              })
-
-              override fun onTouchEvent(e: MotionEvent): Boolean {
-                  if (!interactive) return false
-                  when (e.actionMasked) {
-                      MotionEvent.ACTION_DOWN -> { dX = e.rawX; dY = e.rawY; lx = dX; ly = dY; moved = false }
-                      MotionEvent.ACTION_MOVE -> {
-                          if (!moved && (abs(e.rawX - dX) > slop || abs(e.rawY - dY) > slop)) moved = true
-                          if (moved) { onDrag?.invoke(e.rawX - lx, e.rawY - ly); lx = e.rawX; ly = e.rawY }
-                      }
-                  }
-                  gd.onTouchEvent(e)
-                  return true
-              }
-
-              private companion object {
-                  val AHEAD = 0xFF00CC36.toInt()
-                  val BEHIND = 0xFFCC1200.toInt()
-                  val GOLD = 0xFFFFD500.toInt()
-              }
-          }
-          EOF_FILE
-          mkdir -p app/src/main/java/com/patoyedits/floatingtimer
-          cat > app/src/main/java/com/patoyedits/floatingtimer/MainActivity.kt <<'EOF_FILE'
-          package com.patoyedits.floatingtimer
-
-          import android.Manifest
-          import android.app.Activity
-          import android.content.Intent
-          import android.content.pm.PackageManager
-          import android.graphics.Color
-          import android.net.Uri
-          import android.os.Build
-          import android.os.Bundle
-          import android.provider.Settings
-          import android.text.Editable
-          import android.text.TextWatcher
-          import android.view.Gravity
-          import android.view.View
-          import android.widget.Button
-          import android.widget.EditText
-          import android.widget.LinearLayout
-          import android.widget.ScrollView
-          import android.widget.SeekBar
-          import android.widget.TextView
-
-          class MainActivity : Activity() {
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
-                  val s = TimerSettings(this)
-                  val dp = resources.displayMetrics.density
-                  fun px(v: Int) = (v * dp).toInt()
-
-                  fun label(t: String) = TextView(this).apply {
-                      text = t; setTextColor(0xFF9A9A9A.toInt()); textSize = 13f; setPadding(0, px(16), 0, px(4))
-                  }
-
-                  fun edit(value: String, hintText: String, multi: Boolean, onChange: (String) -> Unit) = EditText(this).apply {
-                      setText(value); hint = hintText; setTextColor(Color.WHITE); setHintTextColor(0xFF666666.toInt())
-                      if (multi) { minLines = 3; gravity = Gravity.TOP }
-                      addTextChangedListener(object : TextWatcher {
-                          override fun afterTextChanged(e: Editable?) { onChange(e?.toString() ?: "") }
-                          override fun beforeTextChanged(a: CharSequence?, st: Int, c: Int, af: Int) {}
-                          override fun onTextChanged(a: CharSequence?, st: Int, b: Int, c: Int) {}
-                      })
-                  }
-
-                  fun slider(text: String, lo: Int, hi: Int, v: Int, set: (Int) -> Unit) = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                      val tv = label("$text: $v"); addView(tv)
-                      addView(SeekBar(this@MainActivity).apply {
-                          this.max = hi - lo; progress = v - lo
-                          setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                              override fun onProgressChanged(sb: SeekBar?, p: Int, user: Boolean) { set(p + lo); tv.text = "$text: ${p + lo}" }
-                              override fun onStartTrackingTouch(sb: SeekBar?) {}
-                              override fun onStopTrackingTouch(sb: SeekBar?) {}
-                          })
-                      })
-                  }
-
-                  fun button(
+          base64 -d <<'B64' | tar xz
+          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
+          BfwDW0HNiACgAAA=
+          B64
+          gradle assembleRelease --no-daemon
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: Santos Timer ${{ github.run_number }}
+          files: app/build/outputs/apk/release/*.apk
